@@ -1,0 +1,422 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64  : require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+#include "shared_structs.h"
+
+#define EMISSION_COEFFICIENT 0.2f
+#define Pi32 3.1415926535897932384626
+
+// The ray payload, attached to a ray; used to communicate between shader stages.
+layout(location=0) rayPayloadEXT RayPayload payload;
+
+// Push constant for ray tracing shaders
+layout(push_constant) uniform _PushConstantRay { PushConstantRay pcRay; };
+
+// Ray tracing descriptor set: 0:acceleration structure, and 1: color output image
+layout(set=0, binding=0) uniform accelerationStructureEXT topLevelAS;
+layout(set=0, binding=1, rgba32f) uniform image2D colCurr; // Output image: m_rtColCurrBuffer
+layout(set=0, binding=2, rgba32f) uniform image2D colPrev; // Output image: m_rtColPrevBuffer
+layout(set=0, binding=3, rgba32f) uniform image2D NdCurr; // Output image: m_rtNdCurrBuffer
+layout(set=0, binding=4, rgba32f) uniform image2D NdPrev; // Output image: m_rtNdPrevBuffer
+layout(set=0, binding=5, rgba32f) uniform image2D KdCurr; // Output image: m_rtKdCurrBuffer
+
+// Object model descriptor set: 0: matrices, 1:object buffer addresses, 2: texture list
+layout(set=1, binding=0) uniform _MatrixUniforms { MatrixUniforms mats; };
+layout(set=1, binding=1, scalar) buffer ObjDesc_ { ObjDesc i[]; } objDesc;
+layout(set=1, binding=2) uniform sampler2D textureSamplers[];
+
+// Object buffered data; dereferenced from ObjDesc addresses
+layout(buffer_reference, scalar) buffer Vertices {Vertex v[]; }; // Position, normals, ..
+layout(buffer_reference, scalar) buffer Indices {ivec3 i[]; }; // Triangle indices
+layout(buffer_reference, scalar) buffer Materials {Material m[]; }; // Array of all materials
+layout(buffer_reference, scalar) buffer MatIndices {int i[]; }; // Material ID for each triangle
+
+// Generate a random unsigned int from two unsigned int values, using 16 pairs
+// of rounds of the Tiny Encryption Algorithm. See Zafar, Olano, and Curtis,
+// "GPU Random Numbers via the Tiny Encryption Algorithm"
+uint tea(uint val0, uint val1)
+{
+  uint v0 = val0;
+  uint v1 = val1;
+  uint s0 = 0;
+
+  for(uint n = 0; n < 16; n++)
+  {
+    s0 += 0x9e3779b9;
+    v0 += ((v1 << 4) + 0xa341316c) ^ (v1 + s0) ^ ((v1 >> 5) + 0xc8013ea4);
+    v1 += ((v0 << 4) + 0xad90777d) ^ (v0 + s0) ^ ((v0 >> 5) + 0x7e95761e);
+  }
+
+  return v0;
+}
+
+// Generate a random unsigned int in [0, 2^24) given the previous RNG state
+// using the Numerical Recipes linear congruential generator
+uint lcg(inout uint prev)
+{
+    uint LCG_A = 1664525u;
+    uint LCG_C = 1013904223u;
+    prev       = (LCG_A * prev + LCG_C);
+    return prev & 0x00FFFFFF;
+}
+
+// Generate a random float in [0, 1) given the previous RNG state
+float rnd(inout uint prev)
+{
+    return (float(lcg(prev)) / float(0x01000000));
+}
+
+// Returns a vector around A, at a "polar" angle cos=cTheta, and an "equatorial" angle Phi
+vec3 SampleLobe(vec3 A, float cTheta, float Phi)
+{
+    float sTheta = sqrt(1- cTheta*cTheta); // Sine of Theta
+    vec3 K = vec3(sTheta*cos(Phi), sTheta*sin(Phi), cTheta); // Vector centered on Z instead of A
+
+
+    // Form coordinate frame around A
+    if (abs(A.z-1.0) < 1e-3) return K;
+    if (abs(A.z+1.0) < 1e-3) return vec3(K[0], -K[1], -K[2]);
+    vec3 B = normalize(vec3(-A[1], A[0], 0.0)); // Z x A
+    vec3 C = cross(A,B);
+    
+    // Rotate Z to A, taking K along with
+    return K[0]*B + K[1]*C + K[2]*A;
+}
+
+float square(float value)
+{
+    return value * value;
+}
+
+// NOTE(joon) d is a dot()
+vec3 fresnel(vec3 Ks, float l_dot_h)
+{
+    vec3 result = vec3(0, 0, 0);
+    result = Ks + (1 - pow(1.0f - abs(l_dot_h), 5.0f)) * (vec3(1, 1, 1) - Ks);
+
+    return result;
+}
+
+// NOTE(joon) This is the D part of the brdf equation
+float ggx_distribution(vec3 N, vec3 H, float roughness)
+{
+    float roughness_square = square(roughness);
+
+    float n_dot_h = dot(N, H);
+    float tan_theta = sqrt(1.0f - square(n_dot_h)) / n_dot_h;
+
+    return max((n_dot_h * roughness_square) / (Pi32 * pow(n_dot_h, 4.0f) * square(roughness_square + square(tan_theta))), 0.0f);
+}
+
+// NOTE(joon) w can be either wo or wi
+float geometry(vec3 w, vec3 N, vec3 H, float roughness)
+{
+    float roughness_square = square(roughness);
+    float n_dot_h =dot(N, H);
+    float tan_theta = sqrt(1.0f - square(dot(w, N))) / dot(w, N);
+
+    float result = max((dot(w, H) / dot(w, N)) * (2.0f / (1.0f + sqrt(1 + roughness_square * square(tan_theta)))), 0.0f);
+
+    return result;
+}
+
+
+// Returns *almost* the full lighting calculation.
+// Full lighting calculation includes I (N dot L) BRDF(...)
+// This excludes light I;    returns    (N dot L) BRDF(...)
+// returns full  NL*(Kd/pi+F*G*D/den);  or diffuse only NL*(Kd/pi) lighting calc.
+vec3 EvalBrdf(vec3 N, vec3 Wi, vec3 Wo, Material mat) 
+{
+    vec3 diffuse = (1.0f / Pi32) * mat.diffuse;
+    vec3 specular = vec3(0, 0, 0);
+    
+#if 0 
+    vec3 H = normalize(Wi + Wo);
+    float l_dot_h = dot(Wi, H);
+
+    // TODO(gyuhyun) double check the math here
+    float roughness = mat.shininess;
+    // float roughness = 1.0f;
+
+    if(l_dot_h > 0.0f && 
+       (dot(mat.specular, mat.specular) != 0.0f))
+    {
+        // NOTE(joon) fresnel already contains the Ks(specular term)
+        vec3 F = fresnel(mat.specular, l_dot_h);
+        float D = max(ggx_distribution(N, H, roughness), 0);
+        float G = max(geometry(Wi, N, H, roughness) * geometry(Wo, N, H, roughness), 0);
+
+        float wi_dot_n = dot(Wi, N);
+        float wo_dot_n = dot(Wo, N);
+        specular = ((D*G) / (4.0f * abs(wi_dot_n) * abs(wo_dot_n))) * F;
+    }
+#endif
+
+    return abs(dot(Wi, N)) * (diffuse + specular);
+}
+
+float RandomFloat(uint m) 
+{
+    const uint ieeeMantissa = 0x007FFFFFu; // binary32 mantissa bitmask
+    const uint ieeeOne      = 0x3F800000u; // 1.0 in IEEE binary32
+
+    m &= ieeeMantissa;                     // Keep only mantissa bits (fractional part)
+    m |= ieeeOne;                          // Add fractional part to 1.0
+
+    float  f = uintBitsToFloat( m );       // Range [1:2]
+
+    return f - 1.0f;                        // Range [0:1]
+}
+
+// Sample a cosine log around the N direction;
+// Later, get smart about specular directions.
+vec3 SampleBrdf(inout uint seed, in vec3 N) 
+{
+    return normalize(SampleLobe(N, sqrt(rnd(seed)), 2 * Pi32 * rnd(seed)));
+}
+
+float
+PdfBrdf(vec3 N, vec3 Wi)
+{
+     return abs(dot(N, Wi)) / Pi32;
+}
+
+void accumulateSample(vec3 firstNrm, 
+                      float firstDepth, // Projected point’s normal and depth
+                      ivec2 loc, // The pixel’s location (one of the four)
+                      float bilinearWeight, // The pixel’s bilinear weight
+                      inout vec4 sumC, inout float sumW // To receive the accumulated values
+){
+    vec4 prevColor = imageLoad(colPrev, ivec2(gl_LaunchIDEXT.xy));
+    vec4 prevNd = imageLoad(NdPrev, ivec2(gl_LaunchIDEXT.xy));
+    vec3 prevNormal = prevNd.xyz;
+    float prevDepth = prevNd.w;
+
+    // TODO(gyuhyun) These variables will be included in m_pcDenoise
+    float nThreshold = 0.95f;
+    float dThreshold = 0.15f;
+
+    firstNrm = normalize(firstNrm);
+    prevNormal = normalize(prevNormal);
+
+    float w = bilinearWeight;
+    if((dot(firstNrm, prevNormal) < nThreshold) || 
+        abs(firstDepth - prevDepth) > dThreshold)
+    {
+        w = 0.0f;
+    }
+
+	sumC += w * prevColor;
+	sumW += w;
+}
+
+void main() 
+{
+    // In shaders/shared_structs.h add some random number functionality:
+    //  To PushConstantRay add uint frameSeed and initialize to rand() % 32768 in VkApp::raytrace
+    //  To RayPayload, add uint seed, and initialize like this:
+    payload.seed = tea(gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x, pcRay.frameSeed);
+
+    // This invocation is for a pixel indicated by gl_LaunchIDEXT
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    vec2 pixelNDC = pixelCenter/vec2(gl_LaunchSizeEXT.xy)*2.0 - 1.0;
+ 
+    vec3 eyeW    = (mats.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 pixelH = mats.viewInverse * mats.projInverse * vec4(pixelNDC.x, pixelNDC.y, 1, 1);
+    vec3 pixelW = pixelH.xyz/pixelH.w;
+    
+    vec3 rayO    = eyeW;
+    vec3 rayD = normalize(pixelW - eyeW);
+    payload.hit = false;
+
+    vec3 firstPos = vec3(0, 0, 0);
+    vec3 firstNormal = vec3(0, 0, 0);
+    vec3 firstColor = vec3(0, 0, 0);
+    float firstDepth = 1.0f;
+
+    // Most of the ray casting code goes in a loop:
+    // Accumulate color in a vec3 C initialized to (0,0,0)
+    // Accumulate product of f/p weights in vec3 W initialized to (1, 1, 1)
+    vec3 accumulatedColor = vec3(0, 0, 0);
+    vec3 weight = vec3(1,1,1);
+
+    for (int i=0; 
+         i < pcRay.depth;  
+         ++i) 
+    {
+        // Fire the ray;  hit or miss shaders will be invoked, passing results back in the payload
+        traceRayEXT(topLevelAS,           // acceleration structure
+                    gl_RayFlagsOpaqueEXT, // rayFlags
+                    0xFF,                 // cullMask
+                    0,                    // sbtRecordOffset
+                    0,                    // sbtRecordStride
+                    0,                    // missIndex
+                    rayO,                 // ray origin
+                    0.001f,                // ray min range
+                    rayD,                 // ray direction
+                    10000.0f,              // ray max range
+                    0                     // payload (location = 0)
+                    );
+
+        // If nothing was hit, output background color.
+        if (!payload.hit) 
+        {
+            break; 
+        }
+
+        // If something was hit, find the object data.
+        // Object data (containing 4 device addresses)
+        ObjDesc    objResources = objDesc.i[payload.instanceIndex];
+    
+        // Dereference the object's 4 device addresses
+        Vertices   vertices    = Vertices(objResources.vertexAddress);
+        Indices    indices     = Indices(objResources.indexAddress);
+        Materials  materials   = Materials(objResources.materialAddress);
+        MatIndices matIndices  = MatIndices(objResources.materialIndexAddress);
+  
+        // Use gl_PrimitiveID to access the triangle's vertices and material
+        ivec3 ind    = indices.i[payload.primitiveIndex]; // The triangle hit
+        int matIdx   = matIndices.i[payload.primitiveIndex]; // The triangles material index
+        Material mat = materials.m[matIdx]; // The triangles material
+
+        // If material indicates triangle is a light, pass the light's
+        // emission through all BRDFs to output to a  pixel.
+        
+        // A previous instruction to scale emission by 5 should be
+        // ignored.  Scale it as necessary to produce a comfortable
+        // image. Better yet, include a GUI slider to adjust exposure.
+        if (dot(mat.emission,mat.emission) > 0.0001f) 
+        {
+            accumulatedColor = EMISSION_COEFFICIENT * mat.emission * weight; 
+            break; 
+        }
+
+        // Vertex of the triangle (Vertex has pos, nrm, tex)
+        Vertex v0 = vertices.v[ind.x];
+        Vertex v1 = vertices.v[ind.y];
+        Vertex v2 = vertices.v[ind.z];
+
+        // Computing the normal and tex coord at hit position
+        const vec3 bc = payload.bc; // The barycentric coordinates of the hit point
+        const vec3 nrm  = bc.x*v0.nrm      + bc.y*v1.nrm      + bc.z*v2.nrm;
+        const vec2 uv =  bc.x*v0.texCoord + bc.y*v1.texCoord + bc.z*v2.texCoord;
+
+        // If the material has a texture, read diffuse color from it.
+        if (mat.textureId >= 0) 
+        {
+            uint txtId = objResources.txtOffset + mat.textureId;
+            mat.diffuse = texture(textureSamplers[(txtId)], uv).xyz; 
+        }
+
+        // TODO(gyuhyun) Where should I put this, exactly?
+        if(i == 0)
+        {
+            // TODO(gyuhyun) Should this be a camera pos, or the first his pos? 
+            firstPos = payload.hitPos;
+            firstColor = mat.diffuse;
+            firstDepth = payload.hitDist;
+            firstNormal = normalize(nrm);
+        }
+
+        // From the current hit point, setup N,L,V for BRDF calculation
+        vec3 P = payload.hitPos;  // Current hit point
+        vec3 N = normalize(nrm);  // Its normal
+        vec3 Wi = normalize(SampleBrdf(payload.seed, N));
+        vec3 Wo = normalize(-rayD);
+        
+        // Color via a BRDF calculation
+        vec3 f = EvalBrdf(N, Wi, Wo, mat);
+        float p = PdfBrdf(N,Wi);
+        if (p > 0.001f && !any(isnan(f)))
+        {
+            weight = (f/p) * weight;           // Monte-Carlo
+
+			// Step forward: Set the next ray's origin and direction to
+			// current point P, and the next sample direction Wi.
+			rayO    = P;
+			rayD = normalize(Wi);
+        }
+        else
+        {
+            break;
+        }
+    }
+    
+	vec4 screenH = (mats.priorViewProj * vec4(firstPos, 1.0)); //Project to prev buffers
+	vec2 screen = ((screenH.xy/screenH.w) + vec2(1.0)) / 2.0; //H-division and map to [0,1]
+    vec3 oldAve = vec3(0);
+    float oldN = 0;
+
+	// If first... values were not defined, OR were defined but off-screen in Prev buffers:
+	if (dot(firstPos,firstPos) == 0.0 || 
+        screen.x < 0 || screen.x > 1 || 
+        screen.y < 0 || screen.y > 1) 
+    {
+		// Restart pixels accumulation with:
+		oldN = 0;
+		oldAve = vec3(0); 
+    }
+	else 
+    {
+		// Retrieve previous accumulation value as a selectively weighted
+		// bilinear interpolation of four neighboring pixels in colPrev buffer
+		vec2 floc = screen * gl_LaunchSizeEXT.xy - vec2(0.5);
+		vec2 off = fract(floc); // offset of current pixel between 4 neighbors.
+		ivec2 iloc = ivec2(floc); // (0,0) corner of the 4 neighbors.
+
+		// Accumulate 4 numerators(weight*color) and denominators (weights only)
+		vec4 sumC = vec4(0,0,0,0);
+		float sumW = 0;
+		// Standard notation for the bilinear weights used in 4th parameter below
+		float x0 = 1.0-off.x; 
+        float x1 = off.x; 
+        float y0 = 1.0-off.y; 
+        float y1 = off.y;
+
+		// Accumualate numerator and denominator across 4 pixels in a 2x2 pattern:
+		// See last page of document for details of accumulateSample.
+		accumulateSample(firstNormal, firstDepth, iloc+ivec2(0,0), x0*y0, sumC, sumW);
+		accumulateSample(firstNormal, firstDepth, iloc+ivec2(1,0), x1*y0, sumC, sumW);
+		accumulateSample(firstNormal, firstDepth, iloc+ivec2(0,1), x0*y1, sumC, sumW);
+		accumulateSample(firstNormal, firstDepth, iloc+ivec2(1,1), x1*y1, sumC, sumW);
+
+		// The interpolated history value is sumC/sumW, then split into average and count
+		// Handle the denominator==0 case: Reset history with oldN=0, oldAve=(0,0,0);
+        if(sumW == 0.0f)
+        {
+            oldN = 0;
+            oldAve = vec3(0);
+        }
+        else
+        {
+			vec4 history = sumC/sumW;
+			oldAve = history.xyz;
+			oldN = history.w;
+        }
+	}
+	// Accumulate new color C into old (or newly reset) history value
+    float newN = oldN + 1.0f;
+    vec3 newAve = oldAve + (accumulatedColor - oldAve) / newN;
+
+    if(!any(isnan(newAve)))
+    {
+        imageStore(colCurr, ivec2(gl_LaunchIDEXT.xy), vec4(newAve,newN));
+    }
+
+    // Also store the color, normal and depth values
+    if(!any(isnan(firstColor)))
+    {
+        imageStore(KdCurr, ivec2(gl_LaunchIDEXT.xy), vec4(firstColor, 0));
+    }
+
+    if(!any(isnan(firstNormal)) && !isnan(firstDepth))
+    {
+        imageStore(NdCurr, ivec2(gl_LaunchIDEXT.xy), vec4(firstNormal, firstDepth));
+    }
+}
+
